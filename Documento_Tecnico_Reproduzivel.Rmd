@@ -1,0 +1,566 @@
+---
+title: "Desafio Magazine Luiza"
+output: pdf_document
+author:
+- name: Bruno Kuasney
+abstract: "Documento consiste em analisar e interpretar resultados e parâmetros estatísticos obtidos do teste. O teste consiste em classificar distintos produtos e, posteriormente, obter uma previsão da demanda desses produtos nos próximos meses"
+keywords: "pandoc, r markdown, knitr"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+geometry: margin=1in
+fontfamily: mathpazo
+fontsize: 11pt
+# spacing: double
+biblio-style: apsr
+endnote: no
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(fig.width=6, fig.height=4)
+#knitr::opts_chunk$set(out.width='750px', dpi=200)
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE)
+```
+
+**Códigos dos outputs do documento estarão disponíveis no GitHub.**
+**Documento apresentará apenas principais resultados. Tratamento de base, agrupamento, códigos, etc, não serão mostrados aqui**
+
+
+# Etapa 1 - Classificação
+
+Para classificação utilizaremos a metodologia de cluster, analisando o melhor valor para o parâmetro "K" para o agrupamento em questão.
+
+Para isso, devemos interpretar como exetamente devemos particionar nossa base.
+
+A base consiste em:
+```{r carregando os dados,echo=FALSE}
+setwd("C:/Users/bkuasney/Desktop/Machine Learning A-Z/DESAFIO LUIZA LABS")
+dt = read.csv('desafio.csv', sep=',', dec='.', encoding = 'uft8')
+```
+
+`r nrow(dt)` observações distribúidas em `r ncol(dt)` variáveis. Sendo as variáveis: `r names(dt)`
+
+Para a realização do cluster, podemos partir de 4 técnicnas distintas:
+
+1. utilizar metodologia de Kmeans com distâncias euclidianas (bastante utilizada para Cluster, utiliza comente de dados quantitativos)
+2. Utilizar metodologia de distância de Gower (que clusteriza com base em dados quantitativos e dados qualitativos)
+3. Observar a performance de distâncias euclidianas utilizando variávies dummy para "burlar" os dados qualitativos
+4. Rodar modelos K-means, Knn, Pam e clara utilizando de bootstrap, k-fold ou reamostragem para analisar o melhor modelo
+
+O mais correto seria utilizar o último método, que tornaria nossa análise mais assertiva. Porém, escolhi o primeiro método por ser mais "ágil" e principalmente ser um método mais confiável "às escuras".
+
+
+Fazendo o tratamento dos dados, ficamos com:
+```{r tratamento dos dados,message=FALSE,echo=FALSE}
+require(sqldf)
+dtrat = sqldf('select 
+              order_id,
+              code,
+              quantity,
+              cast(price as decimal(2)),
+              cast(pis_cofins as decimal(2)),
+              cast(icms as decimal(2)),
+              cast(tax_substitution as decimal(2)),
+              category,
+              cast(liquid_cost as decimal(2)),
+              order_status,
+              capture_date,
+              process_date,
+              process_status,
+              source_channel
+              from dt')
+
+dcluster = sqldf('select 
+                 code,
+                 quantity,
+                 cast(price as decimal(2)) as price,
+                 cast(pis_cofins as decimal(2)) as pis_cofins,
+                 cast(icms as decimal(2)) as icms,
+                 cast(tax_substitution as decimal(2)) as tax_substitution,
+                 cast(liquid_cost as decimal(2)) as liquid
+                 from dt')
+dcluster = na.omit(dcluster)
+
+# Produtos únicos e suas quantidades.
+cluster = sqldf('Select code, sum(price) as price, sum(quantity) as qtd, sum(liquid) as liquid, sum(pis_cofins) as pis, sum(icms) as icms, sum(tax_substitution) as tax
+                from dcluster group by code')
+row.names(cluster)=cluster[,1]
+```
+
+1. `r ncol(cluster)` variáveis, sendo elas:  `r names(cluster)`
+2. Distribuídas em `r nrow(cluster)` observações
+
+Como a ideia é clusterizar produtos, parti do princípio de que os produtos em si não precisariam ser correlacionados com as outras variáveis, como categoria, source_channel, order_status, etc...
+
+Fizemos então o agrupamento considerando apenas as variáveis acima.
+
+
+**Foi mencionado no documento de teste que os produtos deveriam ser classificados de acordo com sua peculariedade. Considerei no agrupamento que as peculariedades de cada produto eram definidas pelo seu código, onde, caso existisse a peculariedade, o código do produto era alterado.**
+
+**Caso isso não fosse verdade, poderíamos agrupar pelas taxas de cada produto, onde cada peculariedade do produto era definida de acordo com as taxas cobradas. Porém, ao realizar esse agrupamento e gerar as classificações, acabei me deparando com problemas de performance computacional, voltando então com a ideia citada no parágrafo acima**
+
+Fazendo-se o plot entre a quantidade e o preço, conseguimos observar alguns outliers
+```{r plot dos dados,message=FALSE, echo=FALSE}
+plot(qtd ~ price, data = cluster)
+cluster = cluster[-c(25L, 27L, 28L,46L),]
+d.stand <- scale(cluster[-1])
+```
+
+1.  Eliminamos os outliers da base, para não influenciar na classificação. Posteriormente, testaremos o melhor valor de "K" para obtermos os "K" grupos e faremos posteriormente K+1 grupos, com os dados sem a exclusão de outliers.
+2.  Normalizamos os dados para que o modelo possa ser executado.
+
+```
+> Essa normalização dos dados é necessária para que os pesos das variáveis sejam consideradas iguais pelo algoritmo. Ex: se tenho 20 quantidades com valor total de R$100.00,00, o algoritmo acaba entendendo que a variável valor é mais importante que a variável quantidade. A normalização dos dados faz com que os dados oscilem entre -5 a 5 (curva de um gráfico de distribuição normal). O indicador -5 a 5 indica quantos desvios padrões a observação está afastada da média.
+```
+
+Fazemos isso por: 1) verificar a significância dos grupos formados sem outlier e dos grupos formados considerando os outliers. Caso a classificação seja boa para ambos, analisamos com K+1 para ver se é plausível a classificação (para que 1 cluster fique com os outliers caso haja necessidade). 2) Caso a estimação sem o outlier na base seja muito melhor, classificaremos outliers como novo grupo manualmente.
+
+## Definição do Número de Agrupamentos
+
+Geramos agora a estimativa do parâmetro "K", para descobrir qual o melhor número de cluster dado nossa base.
+Utilizei, inicialmente, a metodologia "Elbow". Que gerará um plot com "cotovelos" para o número de cluster.
+Nessa metologia analisamos as distânias dos centros de cada classificação.
+
+
+> *Para a análise (visual) do gráfico, vemos o ângulo das retas entre um ponto K e outro ponto K. Consideramos como melhor valor de "k", ângulos próximos a 90 graus (cotovelos), ou seja, quanto menos na vertical a reta estiver entre um ponto e outro, melhor. Isso nos diz o "ganho" que temos entre selecionar os valores de K.*
+
+
+```{r plot Elbow,message=FALSE, echo=FALSE}
+wssplot <- function(data, nc=15, seed=1234){
+  wss <- (nrow(data)-1)*sum(apply(data,2,var))
+  for (i in 2:nc){
+    set.seed(seed)
+    wss[i] <- sum(kmeans(data, centers=i)$withinss)}
+  plot(1:nc, wss, type="b", xlab="Number of Clusters",
+       ylab="Within groups sum of squares")}
+
+wssplot(d.stand, nc=20)
+
+```
+Vemos que o primeiro cotovelo é formado com K = 2, podendo considerar, também, K=3 ou K=5. Obtendo então um range de possibilidades. O modelo acima nos diz que temos um ganho muito bom entre K=1 e K=2, um ganho menor entre K=2 e K=3 e assim sucessivamente. Até que, a partir de K=5 não temos mais ganhos significativos no aumento de cluster.
+
+Agora que temos um range de observações, utilizaremos o método de silhouette para afunilar o range obtido.
+
+> *Silhouette é uma técnica, que, assim como a técnica utilizada acima, nos dá a melhor possibilidade de clusterização. Seu índice varia de 0 a 1, podendo ser considerado como bom agrupamento valores acima de 0.7.*
+
+
+```{r plot silhouette,message=FALSE, echo=FALSE}
+library(fpc)
+library(cluster)
+pamk.best <- pamk(d.stand)
+plot(pam(d.stand, pamk.best$nc))
+cat("number of clusters estimated by optimum average silhouette width:", pamk.best$nc, "\n")
+
+```
+
+Observamos no primeiro plot que o modelo consegue explicar 96% da variação dos dados. Gerando o plot de análise de componentes principais acima. Observando o segundo plot vemos o gráfico de silhouette, que nos indica também que a melhor clusterização é K=2 grupos. Onde obtemos o maior ganho. Seu índice de qualidade do ajuste é de 0.76, indicando uma boa modelagem dos dados para k=2.
+
+Utilizando mais metodologias para confirmação do método, veremos graficamente o silhouette e as diferenças entre os grupos.
+Ao contrário do método de Elbow, o gráfico de silhouette analisa o maior valor entre os agrupamentos.
+
+```{r plot silhouette2,message=FALSE, echo=FALSE}
+library("factoextra")
+fviz_nbclust(d.stand, kmeans, method = "silhouette")
+```
+
+Novamente, vemos que k=2 nos gera o melhor agrupamento, seguido de K=3 e K=4.
+Por útlimo, geramos um data frame contendo os valores dos índices de silhouette, para compararmos numéricamente os melhores ajustes:
+
+```{r plot silhouette table,message=FALSE, echo=FALSE}
+library("vegan")
+dados.dist <- vegdist(d.stand,method = "euclidean")
+silh  <- matrix(NA, ncol = 1, nrow = 6)
+for(i in 2:6) {
+  value <- summary(silhouette(cutree(hclust(dados.dist,method="average"), i), 
+                              dist(dados.dist)))$avg.width  
+  silh[i, ]  <- value
+}
+silh
+```
+
+Segundo metodologia silhouette para validação de número de agrupamentos, encontramos K=2 e K=3 como sendo os melhores agrupamentos.
+
+Dados todos os índicios acima, utilizaremos K=2 agrupamentos.
+Fazendo uma verificação de cluster com 2 agrupamentos, temos:
+
+```{r plot cluster k2,message=FALSE, echo=FALSE}
+km.res <- kmeans(d.stand, 2, nstart = 25)
+fviz_cluster(km.res, data = d.stand,
+             ellipse.type = "convex",
+             palette = "jco",
+             ggtheme = theme_minimal())
+
+```
+
+A maioria dos produtos acabam pertencendo ao cluster = 2.
+Temos: `r round((km.res$size[1]/nrow(cluster))*100,4)`% para cluster 1 e `r round((km.res$size[2]/nrow(cluster))*100,4)`% para custer 2.
+
+Em resumo:
+>Retirando-se os outlier da base, temos que a melhor classificação é agruparmos as observações em 2 grupos distintos.
+>Como nesse caso não podemos deixar os outlier de fora, vamos, agora, voltar à base com os outliers e analisar, de maneira mais resumida, o melhor agrupamento. Onde, o ideal, é que possamos encontrar K=3 grupos, sendo os clusters 1 e 2 referente a não outliers e 1 agrupamento considerando apenas os outlier e valores próximos.
+
+
+Utilizando apenas da último algoritmo silhouette citado (que nos geram as tabelas com os respectivos índices para cada agrupamento), temos:
+```{r clusterização base original,message=FALSE, echo=FALSE}
+cluster = sqldf('Select code, sum(price) as price, sum(quantity) as qtd, sum(liquid) as liquid, sum(pis_cofins) as pis, sum(icms) as icms, sum(tax_substitution) as tax
+                from dcluster group by code')
+row.names(cluster)=cluster[,1]
+nrow(cluster)
+
+# normalização dos dados
+d.stand <- scale(cluster[-1])
+
+
+dados.dist <- vegdist(d.stand,method = "euclidean")
+silh  <- matrix(NA, ncol = 1, nrow = 6)
+for(i in 2:6) {
+  value <- summary(silhouette(cutree(hclust(dados.dist,method="average"), i), 
+                              dist(dados.dist)))$avg.width  
+  silh[i, ]  <- value
+}
+silh
+
+```
+
+Onde temos uma boa classificação para K=2 novamente, mas k=3 com a base sem retirar os outliers é ainda melhor que k=2 sem os respectivos outliers.
+
+Seguindo a estratégia inicial, utilizaremos K=3. Onde 2 desses cluster conseguem mensurar boa parte dos nossos dados e deixaremos 1 cluster para tratar dados que sejam mais discrepantes.
+
+**Observando a nova classificação e gerando um cluster por "kmeans", temos:**
+
+> *K-means, é uma técnica de cllusterização que leva como base os "vizinhos mais próximos", onde parte-se de um ponto médio e então, vai se agrupando item por item por localização mais próxima, até que nõ haja mais pontos próximos. Isso é feito simultâneamente para todos os K grupos. Nosso método iniciará de 25 grupos distintos e iremos agrupar até que sobrem apenas 3 grupos*
+
+## Clusterização Final utilizando K-means.
+
+```{r plot clusterização base original,message=FALSE, echo=FALSE}
+km.res <- kmeans(d.stand, 3, nstart = 25)
+# Visualize
+fviz_cluster(km.res, data = d.stand,
+             ellipse.type = "convex",
+             palette = "jco",
+             ggtheme = theme_minimal())
+
+```
+Nossa nova classfiicação consegue explicar muito bem a variação dos dados (3,8%+94,6%=~98%).
+Temos atribuídos a cada grupo: `r round((km.res$size[1]/nrow(cluster))*100,2)`% para o primeiro cluster, `r round((km.res$size[2]/nrow(cluster))*100)`% para o segundo cluster e `r round((km.res$size[3]/nrow(cluster))*100)`% para o terceiro cluster.
+
+
+Agora que temos os clusters, fazemos as tranformações necessárias para que possamos dar match com a base original exsitente. Com isso, conseguimos separar os produtos por custerizações e fazer as previsões para cada cluster. Pois, independente da categoria do produto ou do produto em si, seu comportamento é semelhante, fazendo com que seja possível fazermos 3 diferentes previsões ao invés de uma previsão para cada produto distinto.
+
+```{r df final,message=FALSE, echo=FALSE}
+clus = as.matrix(km.res$cluster)
+cluster$clus = clus[,1]
+
+# Voltando com a base original para termos as datas e dando left com os clusters
+dtfinal = sqldf('select * from dt left join cluster using(code)')
+
+# Arrumando formato da data
+library(lubridate)
+dtfinal$capture_date <- mdy(dtfinal$capture_date, locale="en_US.UTF-8")
+dtfinal$process_date <- mdy(dtfinal$process_date, locale="en_US.UTF-8")
+
+dtfinal = dtfinal[,c(1,2,3,4,5,6,7,8,9,10,11,12,13,14,21)]
+
+cluster1 = subset(dtfinal, clus==1)
+cluster1distinct = sqldf('select distinct code from cluster1')
+cluster1qtd = sqldf('select sum(quantity) from cluster1')
+
+cluster2 = subset(dtfinal, clus==2)
+cluster2distinct = sqldf('select distinct code from cluster2')
+cluster2qtd = sqldf('select sum(quantity) from cluster2')
+
+cluster3 = subset(dtfinal, clus==3)
+cluster3distinct = sqldf('select distinct code from cluster3')
+cluster3qtd = sqldf('select sum(quantity) from cluster3')
+
+```
+
+Após o match temos:
+
+* Cluster 1 contém `r nrow(cluster1)` produtos distintos e `r nrow(cluster1distinct)` inserções distintas na base, contabilizando ao todo `r cluster1qtd[1,1]` unidades vendidas.
+* Cluster 2 contém  `r nrow(cluster2)` produtos distintos e `r nrow(cluster2distinct)` inserções distintas na base, contabilizando ao todo `r cluster2qtd[1,1]` unidades vendidas.
+* Cluster 3 contém `r nrow(cluster3)` produtos distintos e `r nrow(cluster3distinct)` inserções distintas na base, contabilizando ao todo `r cluster3qtd[1,1]` unidades vendidas.
+
+
+# Etapa 2 - Previsões para os meses seguintes
+
+## Previsão Cluster 1
+
+Utilizaremos a base gerada acima com suas respectivas variáveis e cluster para filtrar apenas cluster = 1. Posteriormente agruparemos os dados em meses e geraremos uma base de série temporal. Nos retornando:
+
+```{r tratamento series temporais,message=FALSE, echo=FALSE}
+library(data.table)
+library(sqldf)
+library(lubridate)
+tabela <- dtfinal
+
+
+DT=subset(tabela, clus==1)
+DT=aggregate(DT$quantity, list(date = DT$capture_date), sum)
+DT$month_year = dmy(paste("01",substr(DT$date, 6, 7),substr(DT$date, 1, 4), sep="/"))
+DT = subset(DT, month_year != "2017-06-01")
+names(DT) = c("date", "value2", "month_year")
+DT = aggregate(DT$value2, list(month_year = DT$month_year), sum)
+names(DT) = c("month_year", "value2")
+head(DT)
+```
+
+Plotando a série temporal, obtemos o seguinte comportamento:
+
+```{r  series temporais,message=FALSE, echo=FALSE}
+data <- ts(DT[,2], start = c(2016, 6),frequency = 12)
+plot(data, xlab='Month/Years', ylab = 'Qtd')
+```
+
+Notamos aqui já um empecílho: Teremos que validar o modelo através de índices estatísticos, ao invés de utilizarmos validações de treino e teste.
+Isso ocorre pois, se particionarmos a validação entre treino e teste, teríamos que retirar o mês de março/2017, estimar a série temporal e, posteriormente, plotar o comparativo. Porém, temos apenas uma obervação para o mês, não gerando o aprendizado necessário para o teste através de simulação por termos o período de 12 meses fechado. Caso tivéssemos o período de 18 meses por exemplo, conseguiríamos rodar essa forma de análise.
+
+Analisando a ACF e PACF:
+> *Tanto a ACF (autocorrlation function) quanto a PACF () são utilizados para traçar autocorrelações. Esse gráfico nos permite entender se a série é aleatória ou possui alguma tendência ou sazonalidade.*
+
+
+> *A interpretação do gráfico é simples, as linhas tracejadas em azul indicam ruídos brancos/aleatoriedade. Quando todas ou apenas a primeira linha na vertical estiverem dentro desse range, teremos indícios de que a série foi bem modelada, restando apenas resíduos aleatórios que não podem ser modelados pelo algoritmo.*
+> *Quando temos linhas verticais que excedem as linhas horizontais pontilhadas azul, temos indícios de que há sazonalidade ou tendência nos dados, que devem ser tratados antes da execução do algoritmo. Quanto mais a reta passar dessa linha tracejada, maior a sazonalidade ou tendência.*
+> * A sazonalidade só é realmente significativa quando obervamos padrões ao longo das "lags" de tempo.*
+
+```{r  series temporais pacf ,message=FALSE, echo=FALSE}
+acf(ts(diff(log10(data))),main='Qtd')
+pacf(ts(diff(log10(data))),main='Qtd')
+```
+
+Vemos pelo primeiro gráfico que temos uma sazonalidade ou tendência bastante pequena, pois, apesar de termos observações que extrapolam a linha tracejada, ela não possui um padrão específico de sazonalidade. Mas, por termos essas linhas extrapolando, sabemos que existe uma tendência.
+No segundo gráfico, observamos que essa tendência realmente existe e que será necessário retirar a tendência para análise do modelo. Como temos apeans 1 valor fora da linha tracejada, temos que apenas uma tendência foi identificada.
+
+Rodaremos o modelo de ARIMA, passando uma transformação em log(10) para estimar os dados. Essa transformação é necessária para tornar os dados estacionários (sem a tendência).
+
+> *ARIMA é um modelo auto regressivo (AR), com diferenciação (I) e médias móveis (MA)*
+> *(AR) indica que que a variável de interesse é correlacionada com o tempo anterior*
+> *(MA) indica que o erro de regressão é na verdade uma combinação dos termos dos erros*
+
+```{r  series temporais modelagem arima ,message=FALSE, echo=FALSE}
+require(forecast)
+ARIMAfit = auto.arima(log10(data), approximation=FALSE,trace=FALSE)
+summary(ARIMAfit)
+
+```
+
+O modelo gerado nos retorna ARIMA(1,1,0), onde ARIMA(AR,I,MA). 
+Temos, portanto, que a variável é correlacionada com o tempo anterior e possui uma tendência, utilizada para estimar o modelo.
+
+> *A modelagem de ARIMA consiste em ajustar várias combinações de modelos ARIMA(1,1,1),ARIMA(1,1,0),ARIMA(1,0,1),ARIMA(0,2,2), etc... e nos retorna o melhor modelo segundo o critério AIC e BIC.*
+
+> *AIC e BIC são medidas comparativas, seus valores sozinhos não possuem muita interpretação. AIC e BIC são, de forma mais generalizada, funções de custo (ganho e perda)*
+
+
+Validando o modelo, plotaremos novamente os gráficos de ACF e PACF. Para indicativo de bom ajuste, devemos observar todos os valores dentro do range entre as linhas tracejadas em azul. (Para ACF a primeira linha vertical normalmente será maior, podemos desconsiderar a primeira lag)
+
+```{r  series temporais validação ,message=FALSE, echo=FALSE}
+pred2 = forecast(ARIMAfit, h = 3)
+acf(ts(pred2$residuals),main='ACF Residual')
+pacf(ts(pred2$residuals),main='PACF Residual')
+```
+
+Temos indícios de que a modelagem foi boa.
+Fazendo um segundo teste, buscaremos os resíduos (parte dos dados que não foi possível modelar) e, estimaremos um novo modelo ARIMA. O resultado que queremos obter é ARIMA(0,0,0) que indica ruído branco e indica que os resíduos estão normalizados.
+Caso obtenhamos outro modelo que não ARIMA(0,0,0) podemos adidiconar esse modelo à previsão, fazendo um *boosting* do modelo.
+
+```{r  series temporais validação 2,message=FALSE, echo=FALSE}
+pred2 = forecast(ARIMAfit, h = 3)
+auto.arima(pred2$residuals, approximation=FALSE,trace=FALSE)
+```
+
+Obtemos ARIMA(0,0,0), portanto, a modelagem respondeu bem aos dados.
+
+Utilizaremos, portanto, ARIMA(1,1,0) para predizer os próximos 3 meses.
+
+```{r  series temporais previsão ,message=FALSE, echo=FALSE}
+pred = predict(ARIMAfit, n.ahead = 3)
+pred2 = forecast(ARIMAfit, h = 3)
+
+plot(data,type='l',xlim=c(2016.4, 2017.6),ylim=c(4000,23000),xlab = 'Month/Year',ylab = 'Qtd')
+lines(10^(pred$pred),col='blue')
+```
+
+E seus respectivos valores:
+
+```{r  series temporais previsão 2,message=FALSE, echo=FALSE}
+10^pred2$mean
+jun = 10^pred2$mean[1]
+jul = 10^pred2$mean[2]
+ago = 10^pred2$mean[3]
+
+```
+
+Portanto, para os 3 meses seguintes para o cluster = 1, temos a previsão de demanda de:
+
+```{r  series temporais final,message=FALSE, echo=FALSE}
+paste("Junho: ",round(10^pred2$mean[1],0),"itens")
+paste("Julho: ",round(10^pred2$mean[2],0),"itens")
+paste("Agosto: ",round(10^pred2$mean[3],0),"itens")
+
+```
+
+
+## Repetiremos o mesmo processo para Cluster = 2 e Cluster = 3, porém, sem divagar sobre as metodologias utilizadas.
+
+## Cluster 2
+Fazendo os mesmos tratamento e buscando na base apenas cluster = 2, temos o seguinte plot:
+
+```{r  plot series temporais 2,message=FALSE, echo=FALSE}
+DT=subset(tabela, clus==2)
+DT=aggregate(DT$quantity, list(date = DT$capture_date), sum)
+DT$month_year = dmy(paste("01",substr(DT$date, 6, 7),substr(DT$date, 1, 4), sep="/"))
+DT = subset(DT, month_year != "2017-06-01")
+names(DT) = c("date", "value2", "month_year")
+DT = aggregate(DT$value2, list(month_year = DT$month_year), sum)
+
+
+data <- ts(DT[,2], start = c(2016, 6),frequency = 12)
+plot(data, xlab='Month/Years', ylab = 'Qtd')
+```
+
+Onde observamos muitas oscilações entre os meses.
+Plotando ACF e PACf temos:
+
+```{r  plot series temporais 2 acf,message=FALSE, echo=FALSE}
+acf(ts(diff(log10(data))),main='Qtd') # Sazonalidade semanal
+pacf(ts(diff(log10(data))),main='Qtd') # Sazonalidade seman
+```
+
+Em relação à série temporal de cluster = 1, observamos um comportamento parecido com tendências e sazonalidades ligeiramente maiores.
+Observando a PACF, vemos um comportamento semelhante à d e cluster = 1. Indicando uma tendência ao longo do tempo.
+
+
+Modelando os dados temos:
+
+```{r  plot series temporais 2 modelagem,message=FALSE, echo=FALSE}
+require(forecast)
+ARIMAfit = auto.arima(log10(data), approximation=FALSE,trace=FALSE)
+summary(ARIMAfit)
+```
+
+Foi identificado pela função que o melhor modelo dentre as combinações possíveis é ARIMA(2,0,0). Dando indício de que o tempo atual possui correlação com o tempo anterior. Ou seja, foi modelado, identificado 1 correlação com o tempo anterior, retirada essa correlação, modelado novamente e identificado uma nova correlação.
+Essas 2 correlações podem ser: 1 correlação do tempo atual com o tempo anterior dado mês a mês e 1 correlação do tempo atual com o tempo anterior dado a cada 3 meses (trimestral).
+
+Analisando a qualidade do ajuste do modelo através do plot de ACF, PACF e ARIMA através dos resíduos. Para identificar algum novo padrão.
+
+```{r  plot series temporais 2 modelagem 2,message=FALSE, echo=FALSE}
+pred2 = forecast(ARIMAfit, h = 3)
+acf(ts(pred2$residuals),main='ACF Residual')
+pacf(ts(pred2$residuals),main='PACF Residual')
+
+auto.arima(pred2$residuals, approximation=FALSE,trace=FALSE)
+
+```
+
+Obtemos ruído branco, aleatoriedade dos dados.
+Todos os gráficos se mostram OK nas suas interpretações e o modelo gerado com os resíduos ARIMA(0,0,0) reforçam que a modelagem responde bem aos dados.
+
+
+Fazendo as predições:
+```{r  plot series temporais 2 modelagem plot previsão,message=FALSE, echo=FALSE}
+pred = predict(ARIMAfit, n.ahead = 3)
+pred2 = forecast(ARIMAfit, h = 3)
+plot(data,type='l',xlim=c(2016.4, 2017.6),ylim=c(min(DT[,2])-1000,11000),xlab = 'Month/Year',ylab = 'Qtd')
+lines(10^(pred$pred),col='blue')
+```
+
+E seus respectivos valores:
+```{r  series temporais 2 previsão 2,message=FALSE, echo=FALSE}
+10^pred2$mean
+jun = 10^pred2$mean[1]
+jul = 10^pred2$mean[2]
+ago = 10^pred2$mean[3]
+
+```
+
+Portanto, para os 3 meses seguintes para o cluster = 1, temos a previsão de demanda de:
+
+```{r  series temporais 2 final,message=FALSE, echo=FALSE}
+paste("Junho: ",round(10^pred2$mean[1],0),"itens")
+paste("Julho: ",round(10^pred2$mean[2],0),"itens")
+paste("Agosto: ",round(10^pred2$mean[3],0),"itens")
+
+```
+
+
+## Cluster 3
+
+Fazendo os mesmos tratamento e buscando na base apenas cluster = 3, temos o seguinte plot:
+
+```{r  plot series temporais 3,message=FALSE, echo=FALSE}
+DT=subset(tabela, clus==3)
+DT=aggregate(DT$quantity, list(date = DT$capture_date), sum)
+DT$month_year = dmy(paste("01",substr(DT$date, 6, 7),substr(DT$date, 1, 4), sep="/"))
+DT = subset(DT, month_year != "2017-06-01")
+names(DT) = c("date", "value2", "month_year")
+DT = aggregate(DT$value2, list(month_year = DT$month_year), sum)
+
+
+data <- ts(DT[,2], start = c(2016, 6),frequency = 12)
+plot(data, xlab='Month/Years', ylab = 'Qtd')
+```
+
+
+Onde observamos tendência crescente ao longo dos meses com alguns vales.
+Plotando ACF e PACf temos:
+
+```{r  plot series temporais 3 acf,message=FALSE, echo=FALSE}
+acf(ts(diff(log10(data))),main='Qtd')
+pacf(ts(diff(log10(data))),main='Qtd')
+```
+
+Porém, a falta de "lags" ultrapassando a linha tracejada pode dar indício de que possua mais aleatoriedade do que padrões na série.
+
+Modelando os dados temos:
+
+```{r  plot series temporais 3 modelagem,message=FALSE, echo=FALSE}
+require(forecast)
+ARIMAfit = auto.arima(log10(data), approximation=FALSE,trace=FALSE)
+summary(ARIMAfit)
+```
+
+Para o cluster = 3, obtemos ARIMA(0,1,0). Esse modelo em particular recebe o nome de "passeio aleatório com deriva", ou seja, a quantidade ao longo dos meses é aleatória segundo o modelo, com parâmetro não aleatório igual a sua tendência. Ou seja, basciamente é a tendência quem dita o forecast.
+
+Analisando a qualidade do ajuste do modelo através do plot de ACF, PACF e ARIMA através dos resíduos. Para identificar algum novo padrão.
+
+```{r  plot series temporais 3 modelagem 2,message=FALSE, echo=FALSE}
+pred2 = forecast(ARIMAfit, h = 3)
+acf(ts(pred2$residuals),main='ACF Residual')
+pacf(ts(pred2$residuals),main='PACF Residual')
+
+auto.arima(pred2$residuals, approximation=FALSE,trace=FALSE)
+
+```
+
+Obtemos ruído branco, aleatoriedade dos dados.
+Todos os gráficos se mostram OK nas suas interpretações e o modelo gerado com os resíduos ARIMA(0,0,0) reforçam que a modelagem responde bem aos dados.
+
+
+
+Fazendo as predições:
+```{r  plot series temporais 3 modelagem plot previsão,message=FALSE, echo=FALSE}
+pred = predict(ARIMAfit, n.ahead = 3)
+pred2 = forecast(ARIMAfit, h = 3)
+plot(data,type='l',xlim=c(2016.4, 2017.6),ylim=c(min(DT[,2])-300,2500),xlab = 'Month/Year',ylab = 'Qtd')
+lines(10^(pred$pred),col='blue')
+```
+
+E seus respectivos valores:
+```{r  series temporais 3 previsão 2,message=FALSE, echo=FALSE}
+10^pred2$mean
+jun = 10^pred2$mean[1]
+jul = 10^pred2$mean[2]
+ago = 10^pred2$mean[3]
+
+```
+
+Portanto, para os 3 meses seguintes para o cluster = 1, temos a previsão de demanda de:
+
+```{r  series temporais 3 final,message=FALSE, echo=FALSE}
+paste("Junho: ",round(10^pred2$mean[1],0),"itens")
+paste("Julho: ",round(10^pred2$mean[2],0),"itens")
+paste("Agosto: ",round(10^pred2$mean[3],0),"itens")
+
+```
+
+
+
